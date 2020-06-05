@@ -33,10 +33,21 @@ volatile unsigned long Plugin_112_pulseTime[TASKS_MAX];
 volatile unsigned long Plugin_112_bounceTimePrevious[TASKS_MAX];
 volatile unsigned long Plugin_112_pulseTimePrevious[TASKS_MAX];
 volatile float Plugin_112_pulseUsage[TASKS_MAX];
+boolean Plugin_112_level[TASKS_MAX];
 
 boolean Plugin_112(byte function, struct EventStruct *event, String& string)
 {
   boolean success = false;
+
+#if 1
+  if (function != PLUGIN_TEN_PER_SECOND && function != PLUGIN_FIFTY_PER_SECOND) {
+    String log = F("Plugin_112 function = ");
+    log += function;
+    log += F(" string = ");
+    log += string;
+    addLog(LOG_LEVEL_DEBUG_DEV, log);
+  }
+#endif
 
   switch (function)
   {
@@ -116,10 +127,11 @@ boolean Plugin_112(byte function, struct EventStruct *event, String& string)
       addHtml(F(":</div><div class=\"div_r\">"));
 
       // Let's prevent divison by zero
-      if(Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh]==0) {
-        Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh]=1000; // if not configged correctly prevent crashes and set it to 1000 as default value.
-      }
-      addHtml(String(Plugin_112_pulseTotalCounter[event->TaskIndex] * 1000 / Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh]));
+//      if(Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh]==0) {
+//        Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh]=1000; // if not configged correctly prevent crashes and set it to 1000 as default value.
+//      }
+//      addHtml(String(Plugin_112_pulseTotalCounter[event->TaskIndex] * 1000 / Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh]));
+      addHtml(String(UserVar[event->BaseVarIndex + 1]));
       addHtml(F("</div>"));
 
       success = true;
@@ -133,17 +145,19 @@ boolean Plugin_112(byte function, struct EventStruct *event, String& string)
       // String log = F("INIT : Load ");
       // log += LoadCustomTaskSettings(event->TaskIndex, (byte*)&Plugin_112_pulseUsage[event->TaskIndex], sizeof(Plugin_112_pulseUsage[event->TaskIndex]));
       // addLog(LOG_LEVEL_INFO, log);
-      Plugin_112_pulseTime[event->TaskIndex]         = UserVar[event->BaseVarIndex + 2];
+//      Plugin_112_pulseTime[event->TaskIndex]         = UserVar[event->BaseVarIndex + 2];
 
       // Restore the total counter from the unused 4th UserVar value.
       // It may be using a formula to generate the output, which makes it impossible to restore
       // the true internal state.
-      Plugin_112_pulseTotalCounter[event->TaskIndex] = UserVar[event->BaseVarIndex + 3];
+//      Plugin_112_pulseTotalCounter[event->TaskIndex] = UserVar[event->BaseVarIndex + 3];
+      Plugin_112_pulseTotalCounter[event->TaskIndex] = 0;
 
       String log = F("INIT : Power ");
       log += Settings.TaskDevicePin1[event->TaskIndex];
       addLog(LOG_LEVEL_INFO, log);
       pinMode(Settings.TaskDevicePin1[event->TaskIndex], INPUT_PULLUP);
+      Plugin_112_level[event->TaskIndex] = digitalRead(Settings.TaskDevicePin1[event->TaskIndex]);
       success = Plugin_112_pulseinit(Settings.TaskDevicePin1[event->TaskIndex], event->TaskIndex);
 
       break;
@@ -152,15 +166,25 @@ boolean Plugin_112(byte function, struct EventStruct *event, String& string)
     case PLUGIN_READ:
     {
       Plugin_112_idleusage(event->TaskIndex);
+      Plugin_112_computeusage(event->TaskIndex);
 
-      UserVar[event->BaseVarIndex]     = floor(Plugin_112_pulseUsage[event->TaskIndex] + 0.5);
-      UserVar[event->BaseVarIndex + 1] = Plugin_112_pulseTotalCounter[event->TaskIndex] * 1000 /
+      // UserVar[event->BaseVarIndex]     = floor(Plugin_112_pulseUsage[event->TaskIndex] + 0.5);
+      UserVar[event->BaseVarIndex]     = Plugin_112_pulseUsage[event->TaskIndex];
+
+      // do not overwrite Wh value so we can set it using Rules:
+//      UserVar[event->BaseVarIndex + 1] += Plugin_112_pulseTotalCounter[event->TaskIndex]; // test as just counter
+      UserVar[event->BaseVarIndex + 1] += Plugin_112_pulseTotalCounter[event->TaskIndex] * 1000.0 /
         Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh];
-      UserVar[event->BaseVarIndex + 2] = Plugin_112_pulseTime[event->TaskIndex];
+      Plugin_112_pulseTotalCounter[event->TaskIndex] = 0;
+      String log = F("ppkWh: ");
+      log +=  Settings.TaskDevicePluginConfig[event->TaskIndex][IndexPulsesPerkWh];
+      addLog(LOG_LEVEL_DEBUG_DEV, log);
+      
+//      UserVar[event->BaseVarIndex + 2] = Plugin_112_pulseTime[event->TaskIndex];
 
       // Store the raw value in the unused 4th position.
       // This is needed to restore the value from RTC as it may be converted into another output value using a formula.
-      UserVar[event->BaseVarIndex + 3] = Plugin_112_pulseTotalCounter[event->TaskIndex];
+//      UserVar[event->BaseVarIndex + 3] = Plugin_112_pulseTotalCounter[event->TaskIndex];
       event->sensorType                = SENSOR_TYPE_DUAL;
 
       // String log = F("READ : Save ");
@@ -176,6 +200,18 @@ boolean Plugin_112(byte function, struct EventStruct *event, String& string)
 }
 
 
+// ToDo: should compute average over all multiple pulses since last reading.
+void Plugin_112_computeusage(byte Index)
+{
+  if (Plugin_112_pulseTime[Index] > 0) {
+    // WH = 3600000 / [pulses per kwh] / [time since last pulse (ms)]
+    Plugin_112_pulseUsage[Index] = floor((3600000000. / Settings.TaskDevicePluginConfig[Index][IndexPulsesPerkWh]) / Plugin_112_pulseTime[Index] + 0.5);
+  } else {
+    Plugin_112_pulseUsage[Index] = 0.0;
+  }
+}
+
+
 /*********************************************************************************************\
  * Update usage when no pulse has been received for some time, so it will decrease on every
  * PLUGIN_READ event instead off keeping the last calculated usage value.
@@ -186,8 +222,9 @@ void Plugin_112_idleusage(byte Index)
   if(PulseTime > (Settings.TaskDeviceTimer[Index] * 1000) &&  // More than $device_delay passed since last pulse
      Plugin_112_pulseTimePrevious[Index] > 0 &&               // Must have at least one pulse received
      PulseTime > Plugin_112_pulseTime[Index] ) {              // More than last pulse interval
+    Plugin_112_pulseTime[Index]         = PulseTime;
     // WH = 3600000 / [pulses per kwh] / [time since last pulse (ms)]
-    Plugin_112_pulseUsage[Index] = (3600000000. / Settings.TaskDevicePluginConfig[Index][IndexPulsesPerkWh]) / PulseTime;
+    //Plugin_112_pulseUsage[Index] = (3600000000. / Settings.TaskDevicePluginConfig[Index][IndexPulsesPerkWh]) / PulseTime;
   }
 }
 
@@ -209,14 +246,18 @@ void Plugin_112_pulsecheck(byte Index)
   {
     Plugin_112_bounceTimePrevious[Index] = now;
 
-    if (!digitalRead(Settings.TaskDevicePin1[Index])) {
+//    if (!digitalRead(Settings.TaskDevicePin1[Index])) {
+    if(Plugin_112_level[Index]) {
       // only update readings on falling edge
+      Plugin_112_level[Index] = false;
       const unsigned long PulseTime       = now - Plugin_112_pulseTimePrevious[Index];
       Plugin_112_pulseTimePrevious[Index] = now;
       Plugin_112_pulseTime[Index]         = PulseTime;
       Plugin_112_pulseTotalCounter[Index]++;
       // WH = 3600000 / [pulses per kwh] / [time since last pulse (ms)]
-      Plugin_112_pulseUsage[Index]        = (3600000000. / Settings.TaskDevicePluginConfig[Index][IndexPulsesPerkWh]) / PulseTime;
+      //Plugin_112_pulseUsage[Index]        = (3600000000. / Settings.TaskDevicePluginConfig[Index][IndexPulsesPerkWh]) / PulseTime;
+    } else {
+      Plugin_112_level[Index] = true;
     }
   }
   interrupts(); // enable interrupts again.
